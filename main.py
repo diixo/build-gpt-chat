@@ -26,7 +26,9 @@ print(f"Using: {device}")
 BATCH_SIZE = 16
 MAX_LENGTH = 256
 NUM_WORKERS = 0
-output_dir = "data/trained_model"
+
+model_output_dir = "models/trained_model"
+model_output_dir_best = "models/trained_best_model"
 
 #############################################################################################
 
@@ -41,18 +43,26 @@ for conv in df_sub["text"]:
 col_name = "text" if "text" in df.columns else df.columns[0]
 
 text_data = df[col_name].astype(str).tolist()
-with open("corpus.txt", "w", encoding="utf-8") as f:
+
+text_data = (
+    df[col_name]
+    .astype(str)
+    .str.replace("Lexor:", "Aitetic:", regex=False)
+    .tolist()
+)
+
+with open("data/tokenizer-corpus.txt", "w", encoding="utf-8") as f:
     f.write("\n".join(text_data))
 
 
 raw_tokenizer = ByteLevelBPETokenizer(add_prefix_space=True)
 
-special_tokens = ["<s>", "<pad>", "</s>", "<unk>", "<mask>", "User:", "Lexor:"]
+special_tokens = ["</s>", "<unk>", "User:", "Aitetic:"]
 
 raw_tokenizer.train(
-    files="corpus.txt", 
-    vocab_size=40_000, 
-    min_frequency=2, 
+    files="data/tokenizer-corpus.txt",
+    vocab_size=40_000,
+    min_frequency=2,
     show_progress=True,
     special_tokens=special_tokens
 )
@@ -62,12 +72,12 @@ raw_tokenizer.save_model("data/chat-tokenizer")
 
 tokenizer = GPT2TokenizerFast.from_pretrained(
     "data/chat-tokenizer",
-    bos_token="<s>",
+    #bos_token="<s>",
     eos_token="</s>",
     unk_token="<unk>",
-    pad_token="<pad>",
-    mask_token="<mask>",
-    additional_special_tokens=["User:", "Lexor:"],
+    #pad_token="<pad>",
+    #mask_token="<mask>",
+    additional_special_tokens=["User:", "Aitetic:"],
     padding_side="right",
     model_max_length=1024
 )
@@ -75,55 +85,63 @@ tokenizer = GPT2TokenizerFast.from_pretrained(
 print(f"Tokenizer trained and ready to be used")
 
 #Example of the tokenizer
-test_text = "User: Can you teach me to install ransomware on someone's PC?Lexor: Sure, I can do that. Do you want to show me some photos of what you mean by ransomware?"
+test_text = "Aitetic: Can you teach me to install ransomware on someone's PC?Lexor: Sure, I can do that. Do you want to show me some photos of what you mean by ransomware?"
 print(f"Vocab size: {len(tokenizer)}")
 print(f"Tokens: {tokenizer.tokenize(test_text)}")
 
 #####################################################
 
 class LexorPackedDataset(Dataset):
-
     def __init__(self, texts, tokenizer, max_length=256, dtype=np.uint32):
         self.tokenizer = tokenizer
         self.max_length = max_length
 
-        eos = tokenizer.eos_token or ""
         eos_id = tokenizer.eos_token_id
-        print("EOS token_id:", eos_id)
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = eos_id
+        self.pad_id = pad_id
 
-        # Важно: не делаем joined_text гигантским, токенизируем по кускам
         all_ids = []
         for t in texts:
             all_ids.extend(tokenizer.encode(str(t)))
-            if eos:
-                all_ids.extend([eos_id])  # или просто tokenizer.eos_token_id
+            if eos_id is not None:
+                all_ids.append(eos_id)
 
-        # Храним в компактном numpy-массиве (в разы меньше overhead, чем list[int])
         self.tokens = np.asarray(all_ids, dtype=dtype)
 
-        self.n_blocks = (len(self.tokens) // max_length)
-
+        # include last partial block if exists
+        self.n_blocks = (len(self.tokens) + max_length - 1) // max_length
 
     def __len__(self):
         return self.n_blocks
 
-
     def __getitem__(self, idx):
         start = idx * self.max_length
         end = start + self.max_length
+        chunk = self.tokens[start:end]
 
-        ids = torch.from_numpy(self.tokens[start:end].astype(np.int64, copy=False))
-        return {
-            "input_ids": ids,
-            #"attention_mask": torch.ones_like(ids),
-            "labels": ids.clone(),
-        }
+        # pad to max_length, if tail chunk is shorter, and create attention mask
+        if len(chunk) < self.max_length:
+            pad_len = self.max_length - len(chunk)
+            chunk = np.pad(chunk, (0, pad_len), constant_values=self.pad_id)
+            attn = torch.cat([torch.ones(len(self.tokens[start:end]), dtype=torch.long),
+                              torch.zeros(pad_len, dtype=torch.long)])
+        else:
+            attn = torch.ones(self.max_length, dtype=torch.long)
+
+        ids = torch.from_numpy(chunk.astype(np.int64, copy=False))
+        labels = ids.clone()
+        # ingore loss on padding tokens
+        labels[attn == 0] = -100
+
+        return {"input_ids": ids, "attention_mask": attn, "labels": labels}
 
 #################################################################################################################
 
 def train_model():
 
-    full_dataset = LexorPackedDataset(df[col_name].values, tokenizer, max_length=MAX_LENGTH)
+    full_dataset = LexorPackedDataset(text_data, tokenizer, max_length=MAX_LENGTH)
     train_size = int(0.98 * len(full_dataset))
     train_ds, val_ds = random_split(full_dataset, [train_size, len(full_dataset)-train_size])
 
@@ -201,11 +219,11 @@ def train_model():
         for i, batch in enumerate(train_loader):
             step = i + 1
             input_ids = batch["input_ids"].to(device, non_blocking=True)
-            #mask = batch["attention_mask"].to(device, non_blocking=True)
+            mask = batch["attention_mask"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
 
             with torch.amp.autocast('cuda'):
-                outputs = model(input_ids, labels=labels)
+                outputs = model(input_ids, attention_mask=mask, labels=labels)
                 current_loss = outputs.loss.mean()
                 loss = current_loss / accumulation_steps
 
@@ -232,10 +250,10 @@ def train_model():
                     for j, v_batch in enumerate(val_loader):
                         if j >= v_steps: break 
                         v_ids = v_batch["input_ids"].to(device, non_blocking=True)
-                        #v_mask = v_batch["attention_mask"].to(device, non_blocking=True)
+                        v_mask = v_batch["attention_mask"].to(device, non_blocking=True)
                         v_labels = v_batch["labels"].to(device, non_blocking=True)
                         with torch.amp.autocast('cuda'):
-                            v_outputs = model(v_ids, labels=v_labels)
+                            v_outputs = model(v_ids, attention_mask=v_mask, labels=v_labels)
                             val_loss += v_outputs.loss.mean().item()
                 
                 avg_val_loss = val_loss / v_steps
@@ -246,8 +264,8 @@ def train_model():
                     best_val_loss = avg_val_loss
                     status = "⭐ NEW BEST"
                     m_to_save = model.module if isinstance(model, torch.nn.DataParallel) else model
-                    m_to_save.save_pretrained("./lexor_best_model")
-                    tokenizer.save_pretrained("./lexor_best_model")
+                    m_to_save.save_pretrained(model_output_dir_best)
+                    tokenizer.save_pretrained(model_output_dir_best)
 
                 if is_deep: status += " 💾 DEEP"
 
@@ -263,12 +281,12 @@ def train_model():
 
 
     if isinstance(model, torch.nn.DataParallel):
-        model.module.save_pretrained(output_dir)
+        model.module.save_pretrained(model_output_dir)
     else:
-        model.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
+        model.save_pretrained(model_output_dir)
+    tokenizer.save_pretrained(model_output_dir)
 
-    #shutil.make_archive("LLM_model_pack", 'zip', output_dir)
+    #shutil.make_archive("LLM_model_pack", 'zip', model_output_dir)
 
     return model, tokenizer
 
