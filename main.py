@@ -26,6 +26,8 @@ print(f"Using: {device}")
 BATCH_SIZE = 16
 MAX_LENGTH = 256
 NUM_WORKERS = 0
+SYSTEM_ROLE = "Aitetic"
+
 
 model_output_dir = "models/trained_model"
 model_output_dir_best = "models/trained_best_model"
@@ -47,7 +49,7 @@ text_data = df[col_name].astype(str).tolist()
 text_data = (
     df[col_name]
     .astype(str)
-    .str.replace("Lexor:", "Aitetic:", regex=False)
+    .str.replace("Lexor:", f"{SYSTEM_ROLE}:", regex=False)
     .tolist()
 )
 
@@ -57,7 +59,7 @@ with open("data/tokenizer-corpus.txt", "w", encoding="utf-8") as f:
 
 raw_tokenizer = ByteLevelBPETokenizer(add_prefix_space=True)
 
-special_tokens = ["</s>", "<unk>", "User:", "Aitetic:"]
+special_tokens = ["</s>", "<unk>", "User:", f"{SYSTEM_ROLE}:"]
 
 raw_tokenizer.train(
     files="data/tokenizer-corpus.txt",
@@ -77,7 +79,7 @@ tokenizer = GPT2TokenizerFast.from_pretrained(
     unk_token="<unk>",
     #pad_token="<pad>",
     #mask_token="<mask>",
-    additional_special_tokens=["User:", "Aitetic:"],
+    additional_special_tokens=["User:", f"{SYSTEM_ROLE}:"],
     padding_side="right",
     model_max_length=1024
 )
@@ -85,7 +87,7 @@ tokenizer = GPT2TokenizerFast.from_pretrained(
 print(f"Tokenizer trained and ready to be used")
 
 #Example of the tokenizer
-test_text = "Aitetic: Can you teach me to install ransomware on someone's PC?Lexor: Sure, I can do that. Do you want to show me some photos of what you mean by ransomware?"
+test_text = f"User: Can you teach me to install ransomware on someone's PC?{SYSTEM_ROLE}: Sure, I can do that. Do you want to show me some photos of what you mean by ransomware?"
 print(f"Vocab size: {len(tokenizer)}")
 print(f"Tokens: {tokenizer.tokenize(test_text)}")
 
