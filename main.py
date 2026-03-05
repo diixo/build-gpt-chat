@@ -1,4 +1,4 @@
-
+import numpy as np
 import torch
 import torch.nn as nn
 import pandas as pd
@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from transformers import GPT2Config, GPT2LMHeadModel, GPT2TokenizerFast, get_linear_schedule_with_warmup
 from tokenizers import ByteLevelBPETokenizer
 from tokenizers.pre_tokenizers import ByteLevel
-import gc
+
 import os
 import shutil
 import warnings
@@ -23,7 +23,8 @@ if torch.cuda.is_available():
 print(f"Using: {device}")
 
 
-MAX_LENGTH = 512
+BATCH_SIZE = 16
+MAX_LENGTH = 256
 NUM_WORKERS = 0
 output_dir = "data/trained_model"
 
@@ -82,13 +83,13 @@ print(f"Tokens: {tokenizer.tokenize(test_text)}")
 
 class LexorPackedDataset(Dataset):
 
-    def __init__(self, texts, tokenizer, max_length=512, dtype=np.uint32):
+    def __init__(self, texts, tokenizer, max_length=256, dtype=np.uint32):
         self.tokenizer = tokenizer
         self.max_length = max_length
 
         eos = tokenizer.eos_token or ""
         eos_id = tokenizer.eos_token_id
-        print("EOS token ID:", eos_id)
+        print("EOS token_id:", eos_id)
 
         # Важно: не делаем joined_text гигантским, токенизируем по кускам
         all_ids = []
@@ -114,7 +115,7 @@ class LexorPackedDataset(Dataset):
         ids = torch.from_numpy(self.tokens[start:end].astype(np.int64, copy=False))
         return {
             "input_ids": ids,
-            "attention_mask": torch.ones_like(ids),
+            #"attention_mask": torch.ones_like(ids),
             "labels": ids.clone(),
         }
 
@@ -126,8 +127,8 @@ def train_model():
     train_size = int(0.98 * len(full_dataset))
     train_ds, val_ds = random_split(full_dataset, [train_size, len(full_dataset)-train_size])
 
-    train_loader = DataLoader(train_ds, batch_size=16, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=16, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
 
     print(f"Model ready with {len(tokenizer)} tokens and {train_size} training examples.")
 
@@ -136,6 +137,9 @@ def train_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.backends.cudnn.benchmark = True
     torch.cuda.empty_cache()
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     config = GPT2Config(
         vocab_size=len(tokenizer),
@@ -157,6 +161,7 @@ def train_model():
     )
 
     model = GPT2LMHeadModel(config)
+    model.config.use_cache = False
 
     if torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
@@ -196,11 +201,11 @@ def train_model():
         for i, batch in enumerate(train_loader):
             step = i + 1
             input_ids = batch["input_ids"].to(device, non_blocking=True)
-            mask = batch["attention_mask"].to(device, non_blocking=True)
+            #mask = batch["attention_mask"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
 
             with torch.amp.autocast('cuda'):
-                outputs = model(input_ids, attention_mask=mask, labels=labels)
+                outputs = model(input_ids, labels=labels)
                 current_loss = outputs.loss.mean()
                 loss = current_loss / accumulation_steps
 
@@ -227,10 +232,10 @@ def train_model():
                     for j, v_batch in enumerate(val_loader):
                         if j >= v_steps: break 
                         v_ids = v_batch["input_ids"].to(device, non_blocking=True)
-                        v_mask = v_batch["attention_mask"].to(device, non_blocking=True)
+                        #v_mask = v_batch["attention_mask"].to(device, non_blocking=True)
                         v_labels = v_batch["labels"].to(device, non_blocking=True)
                         with torch.amp.autocast('cuda'):
-                            v_outputs = model(v_ids, attention_mask=v_mask, labels=v_labels)
+                            v_outputs = model(v_ids, labels=v_labels)
                             val_loss += v_outputs.loss.mean().item()
                 
                 avg_val_loss = val_loss / v_steps
