@@ -22,8 +22,12 @@ if torch.cuda.is_available():
 
 print(f"Using: {device}")
 
-MAX_LENGTH = 1024
 
+MAX_LENGTH = 512
+NUM_WORKERS = 0
+output_dir = "data/trained_model"
+
+#############################################################################################
 
 csv_path = "data/150k-conversations/lexor_dataset_conversations.csv"
 df = pd.read_csv(csv_path)
@@ -64,7 +68,7 @@ tokenizer = GPT2TokenizerFast.from_pretrained(
     mask_token="<mask>",
     additional_special_tokens=["User:", "Lexor:"],
     padding_side="right",
-    model_max_length=MAX_LENGTH
+    model_max_length=1024
 )
 
 print(f"Tokenizer trained and ready to be used")
@@ -101,156 +105,161 @@ class LexorPackedDataset(Dataset):
             "labels": ids.clone()
         }
 
-full_dataset = LexorPackedDataset(df[col_name].values, tokenizer, max_length=MAX_LENGTH)
-train_size = int(0.98 * len(full_dataset))
-train_ds, val_ds = random_split(full_dataset, [train_size, len(full_dataset)-train_size])
-
-train_loader = DataLoader(train_ds, batch_size=16, shuffle=True, num_workers=4, pin_memory=True)
-val_loader = DataLoader(val_ds, batch_size=16, shuffle=False, num_workers=4, pin_memory=True)
-
-print(f"Model ready with {len(tokenizer)} tokens and {train_size} training examples.")
-
 #################################################################################################################
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-torch.backends.cudnn.benchmark = True
-torch.cuda.empty_cache()
+def train_model():
 
-config = GPT2Config(
-    vocab_size=len(tokenizer),
-    n_positions=MAX_LENGTH,
-    n_embd=768,  
-    n_layer=12,
-    n_head=12,        
-    n_inner=3072,
-    activation_function="gelu_new",
-    resid_pdrop=0.1,
-    embd_pdrop=0.1,
-    attn_pdrop=0.1,
-    layer_norm_epsilon=1e-5,
-    initializer_range=0.02,
-    bos_token_id=tokenizer.bos_token_id,
-    eos_token_id=tokenizer.eos_token_id,
-    pad_token_id=tokenizer.pad_token_id,
-    tie_word_embeddings=True
-)
+    full_dataset = LexorPackedDataset(df[col_name].values, tokenizer, max_length=MAX_LENGTH)
+    train_size = int(0.98 * len(full_dataset))
+    train_ds, val_ds = random_split(full_dataset, [train_size, len(full_dataset)-train_size])
 
-model = GPT2LMHeadModel(config)
+    train_loader = DataLoader(train_ds, batch_size=16, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=16, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
 
-if torch.cuda.device_count() > 1:
-    model = torch.nn.DataParallel(model)
-model.to(device)
+    print(f"Model ready with {len(tokenizer)} tokens and {train_size} training examples.")
 
-################################################################
+    #################################################################################################################
 
-epochs = 10
-accumulation_steps = 16 
-val_every_steps = 500
-val_compare_steps = 50
-deep_val_every = 2500
-deep_val_steps = 200 
-lr = 4e-4
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.backends.cudnn.benchmark = True
+    torch.cuda.empty_cache()
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01, fused=True)
-scaler = torch.amp.GradScaler('cuda')
+    config = GPT2Config(
+        vocab_size=len(tokenizer),
+        n_positions=1024,
+        n_embd=768,  
+        n_layer=12,
+        n_head=12,
+        n_inner=3072,
+        activation_function="gelu_new",
+        resid_pdrop=0.1,
+        embd_pdrop=0.1,
+        attn_pdrop=0.1,
+        layer_norm_epsilon=1e-5,
+        initializer_range=0.02,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+        tie_word_embeddings=True
+    )
 
-total_steps_loader = len(train_loader)
-total_steps_optimized = (total_steps_loader * epochs) // accumulation_steps
-scheduler = get_linear_schedule_with_warmup(optimizer, int(total_steps_optimized*0.05), total_steps_optimized)
+    model = GPT2LMHeadModel(config)
 
-global_pbar = tqdm(total=total_steps_loader * epochs, desc="TRAINING PROGRESS", unit="batch", position=0, leave=True)
+    if torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(model)
+    model.to(device)
 
-print(f"\n{'='*85}")
-print(f"{'EPOCH':<8} | {'STEP':<8} | {'TRAIN LOSS':<12} | {'VAL LOSS':<10} | {'LR':<10} | {'STATUS'}")
-print(f"{'='*85}")
+    ################################################################
 
-best_val_loss = float('inf')
+    epochs = 10
+    accumulation_steps = 16
+    val_every_steps = 500
+    val_compare_steps = 50
+    deep_val_every = 2500
+    deep_val_steps = 200
+    lr = 4e-4
 
-torch.cuda.empty_cache()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01, fused=True)
+    scaler = torch.amp.GradScaler('cuda')
 
-for epoch in range(epochs):
-    model.train()
-    optimizer.zero_grad()
-    
-    for i, batch in enumerate(train_loader):
-        step = i + 1
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
-        mask = batch["attention_mask"].to(device, non_blocking=True)
-        labels = batch["labels"].to(device, non_blocking=True)
+    total_steps_loader = len(train_loader)
+    total_steps_optimized = (total_steps_loader * epochs) // accumulation_steps
+    scheduler = get_linear_schedule_with_warmup(optimizer, int(total_steps_optimized*0.05), total_steps_optimized)
+
+    global_pbar = tqdm(total=total_steps_loader * epochs, desc="TRAINING PROGRESS", unit="batch", position=0, leave=True)
+
+    print(f"\n{'='*85}")
+    print(f"{'EPOCH':<8} | {'STEP':<8} | {'TRAIN LOSS':<12} | {'VAL LOSS':<10} | {'LR':<10} | {'STATUS'}")
+    print(f"{'='*85}")
+
+    best_val_loss = float('inf')
+
+    torch.cuda.empty_cache()
+
+    for epoch in range(epochs):
+        model.train()
+        optimizer.zero_grad()
         
-        with torch.amp.autocast('cuda'):
-            outputs = model(input_ids, attention_mask=mask, labels=labels)
-            current_loss = outputs.loss.mean()
-            loss = current_loss / accumulation_steps
-            
-        scaler.scale(loss).backward()
-        
-        if step % accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-            optimizer.zero_grad()
+        for i, batch in enumerate(train_loader):
+            step = i + 1
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            mask = batch["attention_mask"].to(device, non_blocking=True)
+            labels = batch["labels"].to(device, non_blocking=True)
 
-        global_pbar.update(1)
-        global_pbar.set_postfix({"Loss": f"{current_loss.item():.4f}"})
+            with torch.amp.autocast('cuda'):
+                outputs = model(input_ids, attention_mask=mask, labels=labels)
+                current_loss = outputs.loss.mean()
+                loss = current_loss / accumulation_steps
 
-        if step % val_every_steps == 0:
-            model.eval()
-            is_deep = step % deep_val_every == 0
-            v_steps = deep_val_steps if is_deep else val_compare_steps
-            
-            val_loss = 0
-            with torch.no_grad():
-                for j, v_batch in enumerate(val_loader):
-                    if j >= v_steps: break 
-                    v_ids = v_batch["input_ids"].to(device, non_blocking=True)
-                    v_mask = v_batch["attention_mask"].to(device, non_blocking=True)
-                    v_labels = v_batch["labels"].to(device, non_blocking=True)
-                    with torch.amp.autocast('cuda'):
-                        v_outputs = model(v_ids, attention_mask=v_mask, labels=v_labels)
-                        val_loss += v_outputs.loss.mean().item()
-            
-            avg_val_loss = val_loss / v_steps
-            current_lr = scheduler.get_last_lr()[0]
-            
-            status = ""
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                status = "⭐ NEW BEST"
-                m_to_save = model.module if isinstance(model, torch.nn.DataParallel) else model
-                m_to_save.save_pretrained("./lexor_best_model")
-                tokenizer.save_pretrained("./lexor_best_model")
-            
-            if is_deep: status += " 💾 DEEP"
+            scaler.scale(loss).backward()
 
-            print(f"{epoch+1:<8} | {step:<8} | {current_loss.item():<12.4f} | {avg_val_loss:<10.4f} | {current_lr:.2e} | {status}")
-            
-            model.train()
+            if step % accumulation_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad()
+
+            global_pbar.update(1)
+            global_pbar.set_postfix({"Loss": f"{current_loss.item():.4f}"})
+
+            if step % val_every_steps == 0:
+                model.eval()
+                is_deep = step % deep_val_every == 0
+                v_steps = deep_val_steps if is_deep else val_compare_steps
+
+                val_loss = 0
+                with torch.no_grad():
+                    for j, v_batch in enumerate(val_loader):
+                        if j >= v_steps: break 
+                        v_ids = v_batch["input_ids"].to(device, non_blocking=True)
+                        v_mask = v_batch["attention_mask"].to(device, non_blocking=True)
+                        v_labels = v_batch["labels"].to(device, non_blocking=True)
+                        with torch.amp.autocast('cuda'):
+                            v_outputs = model(v_ids, attention_mask=v_mask, labels=v_labels)
+                            val_loss += v_outputs.loss.mean().item()
+                
+                avg_val_loss = val_loss / v_steps
+                current_lr = scheduler.get_last_lr()[0]
+
+                status = ""
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    status = "⭐ NEW BEST"
+                    m_to_save = model.module if isinstance(model, torch.nn.DataParallel) else model
+                    m_to_save.save_pretrained("./lexor_best_model")
+                    tokenizer.save_pretrained("./lexor_best_model")
+
+                if is_deep: status += " 💾 DEEP"
+
+                print(f"{epoch+1:<8} | {step:<8} | {current_loss.item():<12.4f} | {avg_val_loss:<10.4f} | {current_lr:.2e} | {status}")
+
+                model.train()
 
 
-global_pbar.close()
-print(f"{'='*85}")
-print(f"TRAINING COMPLETE | Best Loss: {best_val_loss:.4f}")
-print(f"{'='*85}")
+    global_pbar.close()
+    print(f"{'='*85}")
+    print(f"TRAINING COMPLETE | Best Loss: {best_val_loss:.4f}")
+    print(f"{'='*85}")
 
 
-output_dir = "./LLM_from_scratch"
-if isinstance(model, torch.nn.DataParallel):
-    model.module.save_pretrained(output_dir)
-else:
-    model.save_pretrained(output_dir)
-tokenizer.save_pretrained(output_dir)
+    if isinstance(model, torch.nn.DataParallel):
+        model.module.save_pretrained(output_dir)
+    else:
+        model.save_pretrained(output_dir)
+    tokenizer.save_pretrained(output_dir)
 
-#shutil.make_archive("LLM_model_pack", 'zip', output_dir)
+    #shutil.make_archive("LLM_model_pack", 'zip', output_dir)
+
+    return model, tokenizer
 
 ############################################################
 
 def print_model_stats(model, tokenizer, df, text_column):
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
+
     param_size = sum(p.nelement() * p.element_size() for p in model.parameters())
     buffer_size = sum(b.nelement() * b.element_size() for b in model.buffers())
     size_all_mb = (param_size + buffer_size) / 1024**2
@@ -258,7 +267,7 @@ def print_model_stats(model, tokenizer, df, text_column):
     all_texts = df[text_column].astype(str).tolist()
     tokenized_data = tokenizer(all_texts, truncation=False, padding=False, add_special_tokens=True)
     total_tokens = sum(len(ids) for ids in tokenized_data["input_ids"])
-    
+
     tokens_per_param = total_tokens / total_params
 
     print(f"{'='*40}")
@@ -279,6 +288,21 @@ def print_model_stats(model, tokenizer, df, text_column):
     print(f"Tokens/Param Ratio:    {tokens_per_param:.2f}") 
     print(f"{'='*40}")
 
-m_to_print = model.module if hasattr(model, 'module') else model
-print_model_stats(m_to_print, tokenizer, df, col_name)
 
+
+import multiprocessing as mp
+
+
+def main():
+
+    model, tokenizer = train_model()
+
+    m_to_print = model.module if hasattr(model, 'module') else model
+    print_model_stats(m_to_print, tokenizer, df, col_name)
+
+
+if __name__ == "__main__":
+
+    mp.freeze_support()
+    # mp.set_start_method("spawn", force=True)
+    main()
