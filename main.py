@@ -81,28 +81,41 @@ print(f"Tokens: {tokenizer.tokenize(test_text)}")
 #####################################################
 
 class LexorPackedDataset(Dataset):
-    def __init__(self, texts, tokenizer, max_length=MAX_LENGTH):
+
+    def __init__(self, texts, tokenizer, max_length=512, dtype=np.uint32):
         self.tokenizer = tokenizer
         self.max_length = max_length
 
-        print("Packing dataset... (this may take a moment)")
-        joined_text = (tokenizer.eos_token + " ").join(map(str, texts))
-        tokens = tokenizer.encode(joined_text)
+        eos = tokenizer.eos_token or ""
+        eos_id = tokenizer.eos_token_id
+        print("EOS token ID:", eos_id)
 
-        self.input_chunks = [
-            tokens[i : i + max_length] 
-            for i in range(0, len(tokens) - max_length, max_length)
-        ]
+        # Важно: не делаем joined_text гигантским, токенизируем по кускам
+        all_ids = []
+        for t in texts:
+            all_ids.extend(tokenizer.encode(str(t)))
+            if eos:
+                all_ids.extend([eos_id])  # или просто tokenizer.eos_token_id
+
+        # Храним в компактном numpy-массиве (в разы меньше overhead, чем list[int])
+        self.tokens = np.asarray(all_ids, dtype=dtype)
+
+        self.n_blocks = (len(self.tokens) // max_length)
+
 
     def __len__(self):
-        return len(self.input_chunks)
+        return self.n_blocks
+
 
     def __getitem__(self, idx):
-        ids = torch.tensor(self.input_chunks[idx], dtype=torch.long)
+        start = idx * self.max_length
+        end = start + self.max_length
+
+        ids = torch.from_numpy(self.tokens[start:end].astype(np.int64, copy=False))
         return {
             "input_ids": ids,
             "attention_mask": torch.ones_like(ids),
-            "labels": ids.clone()
+            "labels": ids.clone(),
         }
 
 #################################################################################################################
