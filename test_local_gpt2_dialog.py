@@ -41,7 +41,7 @@ def main():
     history = ""
 
     gen_cfg = GenerationConfig(
-        max_new_tokens=80,
+        max_new_tokens=100,
         do_sample=True,
         temperature=0.8,
         top_p=0.95,
@@ -57,16 +57,24 @@ def main():
         if user.lower() in {"exit", "quit"}:
             break
 
-        prompt = history + f"User: {user}\n{assistant}:"
+        #prompt = history + f"User: {user}\n{assistant}:"
+
+        prompt = f"User: {user}\n{assistant}:"
+
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
         with torch.no_grad():
             out = model.generate(**inputs, generation_config=gen_cfg)
 
-        full = tokenizer.decode(out[0], skip_special_tokens=True)
+        prompt_len = inputs["input_ids"].shape[1]
 
-        # вырезаем только то, что модель добавила после последнего "Assistant:"
+        out = out[0][prompt_len:]   # cut out the prompt tokens, keep only the generated part
+
+        full = tokenizer.decode(out, skip_special_tokens=True)
+
+        # cut out the answer from the full generated text — отрезаем всё до последнего "Lexor:", а дальше — до следующего "User:" (если есть)
         tail = full.split(f"{assistant}:")[-1]
+
         # часто модель тянет дальше "User:" — обрежем
         answer = tail.split("User:")[0].strip()
 
