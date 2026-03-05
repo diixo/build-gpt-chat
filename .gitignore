@@ -18,3 +18,4 @@ train_products/
 train_product/
 
 data/chat-tokenizer/
+data/tokenizer-corpus.txt
